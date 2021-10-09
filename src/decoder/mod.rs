@@ -5,7 +5,6 @@ pub use self::stream::{Decoded, DecodingError, StreamingDecoder};
 use self::stream::{FormatErrorInner, CHUNCK_BUFFER_SIZE};
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::mem;
 use std::ops::Range;
 
 use crate::chunk;
@@ -84,6 +83,12 @@ pub struct InterlacedRow<'data> {
     interlace: InterlaceInfo,
 }
 
+/// A mutable version of `InterlacedRow`, for internal use.
+struct InterlacedRowBuffer<'data> {
+    data: &'data mut [u8],
+    interlace: InterlaceInfo,
+}
+
 impl<'data> InterlacedRow<'data> {
     pub fn data(&self) -> &'data [u8] {
         self.data
@@ -91,6 +96,13 @@ impl<'data> InterlacedRow<'data> {
 
     pub fn interlace(&self) -> InterlaceInfo {
         self.interlace
+    }
+
+    fn from_buffer(buffer: InterlacedRowBuffer<'data>) -> Self {
+        InterlacedRow {
+            data: buffer.data,
+            interlace: buffer.interlace,
+        }
     }
 }
 
@@ -267,24 +279,37 @@ impl<R: Read> ReadDecoder<R> {
 /// Provides a high level that iterates over lines or whole images.
 pub struct Reader<R: Read> {
     decoder: ReadDecoder<R>,
-    bpp: BytesPerPixel,
-    subframe: SubframeInfo,
+    next_frame: SubframeIdx,
     /// Number of frame control chunks read.
     /// By the APNG specification the total number must equal the count specified in the animation
     /// control chunk. The IDAT image _may_ have such a chunk applying to it.
     fctl_read: u32,
-    next_frame: SubframeIdx,
+    limits: Limits,
+    subframe: SubframeInfo,
+    /// The filter subsystem.
+    unfilter: Unfilter,
+    /// The output transformation subsystem.
+    transform: Transformer,
+}
+
+/// Intermediate buffers and state for filtering during reading.
+struct Unfilter {
+    /// Number of bytes in a unit of filtering.
+    bpp: BytesPerPixel,
+    /// Start index of the current scan line.
+    scan_start: usize,
     /// Previous raw line
     prev: Vec<u8>,
     /// Current raw line
     current: Vec<u8>,
-    /// Start index of the current scan line.
-    scan_start: usize,
+}
+
+/// Intermediate buffers and state for output transformation.
+struct Transformer {
     /// Output transformations
     transform: Transformations,
     /// Processed line
     processed: Vec<u8>,
-    limits: Limits,
 }
 
 /// The subframe specific information.
@@ -294,11 +319,20 @@ pub struct Reader<R: Read> {
 /// information and reuse the global interlace options. This struct encapsulates the state of where
 /// in a particular IDAT-frame or subframe we are.
 struct SubframeInfo {
+    /// The pixel width of contained data.
     width: u32,
+    /// The pixel height of contained data.
     height: u32,
     rowlen: usize,
+    /// The iterator state of decoded rows.
     interlace: InterlaceIter,
     consumed_and_flushed: bool,
+    /// The raw color type, required for getting byte size of buffers.
+    color_type: ColorType,
+    /// The bit depth, required for getting byte size of buffers.
+    bit_depth: BitDepth,
+    /// If that frame utilized transparency information.
+    transparency: bool,
 }
 
 #[derive(Clone)]
@@ -322,12 +356,6 @@ enum SubframeIdx {
     End,
 }
 
-macro_rules! get_info(
-    ($this:expr) => {
-        $this.decoder.info().unwrap()
-    }
-);
-
 impl<R: Read> Reader<R> {
     /// Creates a new PNG reader
     fn new(r: R, d: StreamingDecoder, t: Transformations, limits: Limits) -> Reader<R> {
@@ -337,16 +365,20 @@ impl<R: Read> Reader<R> {
                 decoder: d,
                 at_eof: false,
             },
-            bpp: BytesPerPixel::One,
             subframe: SubframeInfo::not_yet_init(),
             fctl_read: 0,
             next_frame: SubframeIdx::Initial,
-            prev: Vec::new(),
-            current: Vec::new(),
-            scan_start: 0,
-            transform: t,
-            processed: Vec::new(),
             limits,
+            unfilter: Unfilter {
+                bpp: BytesPerPixel::One,
+                prev: Vec::new(),
+                current: Vec::new(),
+                scan_start: 0,
+            },
+            transform: Transformer {
+                transform: t,
+                processed: Vec::new(),
+            },
         }
     }
 
@@ -387,19 +419,23 @@ impl<R: Read> Reader<R> {
                 _ => {}
             }
         }
+
         {
             let info = match self.decoder.info() {
                 Some(info) => info,
                 None => return Err(DecodingError::Format(FormatErrorInner::MissingIhdr.into())),
             };
-            self.bpp = info.bpp_in_prediction();
+
+            self.unfilter.bpp = info.bpp_in_prediction();
             // Check if the output buffer can be represented at all.
             // Now we can init the subframe info.
             // TODO: reuse the results obtained during the above check.
             self.subframe = SubframeInfo::new(info);
         }
-        self.allocate_out_buf()?;
-        self.prev = vec![0; self.subframe.rowlen];
+
+        self.transform
+            .allocate_out_buf(&self.subframe, self.limits.bytes)?;
+        self.unfilter.prev = vec![0; self.subframe.rowlen];
         Ok(self.output_info())
     }
 
@@ -419,8 +455,8 @@ impl<R: Read> Reader<R> {
     }
 
     fn reset_current(&mut self) {
-        self.current.clear();
-        self.scan_start = 0;
+        self.unfilter.current.clear();
+        self.unfilter.scan_start = 0;
     }
 
     /// Get information on the image.
@@ -539,112 +575,33 @@ impl<R: Read> Reader<R> {
     pub fn next_interlaced_row(&mut self) -> Result<Option<InterlacedRow>, DecodingError> {
         match self.next_interlaced_row_impl() {
             Err(err) => Err(err),
-            Ok(None) => Ok(None),
-            Ok(s) => Ok(s),
+            Ok(data) => Ok(data.map(InterlacedRow::from_buffer)),
         }
     }
 
     /// Fetch the next interlaced row and filter it according to our own transformations.
-    fn next_interlaced_row_impl(&mut self) -> Result<Option<InterlacedRow>, DecodingError> {
-        use crate::common::ColorType::*;
-        let transform = self.transform;
-
-        if transform == Transformations::IDENTITY {
-            return self.next_raw_interlaced_row();
-        }
-
-        // swap buffer to circumvent borrow issues
-        let mut buffer = mem::replace(&mut self.processed, Vec::new());
-        let (got_next, adam7) = if let Some(row) = self.next_raw_interlaced_row()? {
-            (&mut buffer[..]).write_all(row.data)?;
-            (true, row.interlace)
-        } else {
-            (false, InterlaceInfo::Null)
-        };
-        // swap back
-        let _ = mem::replace(&mut self.processed, buffer);
-
-        if !got_next {
-            return Ok(None);
-        }
-
-        let (color_type, bit_depth, trns) = {
-            let info = self.info();
-            (info.color_type, info.bit_depth as u8, info.trns.is_some())
-        };
-        let output_buffer = if let InterlaceInfo::Adam7 { width, .. } = adam7 {
-            let width = self
-                .line_size(width)
-                .expect("Adam7 interlaced rows are shorter than the buffer.");
-            &mut self.processed[..width]
-        } else {
-            &mut *self.processed
-        };
-
-        let mut len = output_buffer.len();
-        if transform.contains(Transformations::EXPAND) {
-            match color_type {
-                Indexed => expand_paletted(output_buffer, get_info!(self))?,
-                Grayscale | GrayscaleAlpha if bit_depth < 8 => {
-                    expand_gray_u8(output_buffer, get_info!(self))
-                }
-                Grayscale | Rgb if trns => {
-                    let channels = color_type.samples();
-                    let trns = get_info!(self).trns.as_ref().unwrap();
-                    if bit_depth == 8 {
-                        utils::expand_trns_line(output_buffer, &*trns, channels);
-                    } else {
-                        utils::expand_trns_line16(output_buffer, &*trns, channels);
-                    }
-                }
-                _ => (),
-            }
-        }
-
-        if bit_depth == 16 && transform.intersects(Transformations::STRIP_16) {
-            len /= 2;
-            for i in 0..len {
-                output_buffer[i] = output_buffer[2 * i];
-            }
-        }
-
-        Ok(Some(InterlacedRow {
-            data: &output_buffer[..len],
-            interlace: adam7,
-        }))
+    fn next_interlaced_row_impl(&mut self) -> Result<Option<InterlacedRowBuffer>, DecodingError> {
+        Ok(
+            if let Some(row) = self
+                .unfilter
+                .next_raw_interlaced_row(&mut self.subframe, &mut self.decoder)?
+            {
+                let info = self.decoder.info().unwrap();
+                let output = self.transform.transform(info, &self.subframe, row)?;
+                Some(output)
+            } else {
+                None
+            },
+        )
     }
 
     /// Returns the color type and the number of bits per sample
     /// of the data returned by `Reader::next_row` and Reader::frames`.
     pub fn output_color_type(&self) -> (ColorType, BitDepth) {
-        use crate::common::ColorType::*;
-        let t = self.transform;
-        let info = self.info();
-        if t == Transformations::IDENTITY {
-            (info.color_type, info.bit_depth)
-        } else {
-            let bits = match info.bit_depth as u8 {
-                16 if t.intersects(Transformations::STRIP_16) => 8,
-                n if n < 8 && t.contains(Transformations::EXPAND) => 8,
-                n => n,
-            };
-            let color_type = if t.contains(Transformations::EXPAND) {
-                let has_trns = info.trns.is_some();
-                match info.color_type {
-                    Grayscale if has_trns => GrayscaleAlpha,
-                    Rgb if has_trns => Rgba,
-                    Indexed if has_trns => Rgba,
-                    Indexed => Rgb,
-                    ct => ct,
-                }
-            } else {
-                info.color_type
-            };
-            (color_type, BitDepth::from_u8(bits).unwrap())
-        }
+        self.transform.output_color_type(&self.subframe)
     }
 
-    /// Returns the number of bytes required to hold a deinterlaced image frame
+    /// returns the number of bytes required to hold a deinterlaced image frame
     /// that is decoded using the given input transformations.
     pub fn output_buffer_size(&self) -> usize {
         let (width, height) = self.info().size();
@@ -653,7 +610,7 @@ impl<R: Read> Reader<R> {
     }
 
     fn validate_buffer_sizes(&self) -> Result<(), DecodingError> {
-        // Check if the decoding buffer of a single raw line has a valid size.
+        // check if the decoding buffer of a single raw line has a valid size.
         if self.info().checked_raw_row_length().is_none() {
             return Err(DecodingError::LimitsExceeded);
         }
@@ -679,53 +636,16 @@ impl<R: Read> Reader<R> {
         let (color, depth) = self.output_color_type();
         color.raw_row_length_from_width(depth, width) - 1
     }
+}
 
-    /// Returns the number of bytes required to decode a deinterlaced row.
-    fn line_size(&self, width: u32) -> Option<usize> {
-        use crate::common::ColorType::*;
-        let t = self.transform;
-        let info = self.info();
-        let trns = info.trns.is_some();
-
-        let expanded = if info.bit_depth == BitDepth::Sixteen {
-            BitDepth::Sixteen
-        } else {
-            BitDepth::Eight
-        };
-        // The color type and depth representing the decoded line
-        // TODO 16 bit
-        let (color, depth) = match info.color_type {
-            Indexed if trns && t.contains(Transformations::EXPAND) => (Rgba, expanded),
-            Indexed if t.contains(Transformations::EXPAND) => (Rgb, expanded),
-            Rgb if trns && t.contains(Transformations::EXPAND) => (Rgba, expanded),
-            Grayscale if trns && t.contains(Transformations::EXPAND) => (GrayscaleAlpha, expanded),
-            Grayscale if t.contains(Transformations::EXPAND) => (Grayscale, expanded),
-            GrayscaleAlpha if t.contains(Transformations::EXPAND) => (GrayscaleAlpha, expanded),
-            other => (other, info.bit_depth),
-        };
-
-        // Without the filter method byte
-        color.checked_raw_row_length(depth, width).map(|n| n - 1)
-    }
-
-    fn allocate_out_buf(&mut self) -> Result<(), DecodingError> {
-        let width = self.subframe.width;
-        let bytes = self.limits.bytes;
-        let buflen = match self.line_size(width) {
-            Some(buflen) if buflen <= bytes => buflen,
-            // Should we differentiate between platform limits and others?
-            _ => return Err(DecodingError::LimitsExceeded),
-        };
-        self.processed.resize(buflen, 0u8);
-        Ok(())
-    }
-
-    fn next_pass(&mut self) -> Option<(usize, InterlaceInfo)> {
-        match self.subframe.interlace {
+impl Unfilter {
+    fn next_pass(&mut self, subframe: &mut SubframeInfo) -> Option<(usize, InterlaceInfo)> {
+        match subframe.interlace {
             InterlaceIter::Adam7(ref mut adam7) => {
                 let last_pass = adam7.current_pass();
                 let (pass, line, width) = adam7.next()?;
-                let rowlen = self.info().raw_row_length_from_width(width);
+                let rowlen = subframe.raw_row_length_from_width(width);
+
                 if last_pass != pass {
                     self.prev.clear();
                     self.prev.resize(rowlen, 0u8);
@@ -734,16 +654,21 @@ impl<R: Read> Reader<R> {
             }
             InterlaceIter::None(ref mut height) => {
                 let _ = height.next()?;
-                Some((self.subframe.rowlen, InterlaceInfo::Null))
+                Some((subframe.rowlen, InterlaceInfo::Null))
             }
         }
     }
 
     /// Returns the next raw scanline of the image interlace pass.
     /// The scanline is filtered against the previous scanline according to the specification.
-    fn next_raw_interlaced_row(&mut self) -> Result<Option<InterlacedRow<'_>>, DecodingError> {
+    fn next_raw_interlaced_row(
+        &mut self,
+        subframe: &mut SubframeInfo,
+        // FIXME: this could be monomorphic in the argument, with a v-table.
+        decoder: &mut ReadDecoder<impl Read>,
+    ) -> Result<Option<InterlacedRowBuffer<'_>>, DecodingError> {
         let bpp = self.bpp;
-        let (rowlen, passdata) = match self.next_pass() {
+        let (rowlen, passdata) = match self.next_pass(subframe) {
             Some((rowlen, passdata)) => (rowlen, passdata),
             None => return Ok(None),
         };
@@ -771,12 +696,12 @@ impl<R: Read> Reader<R> {
                 self.prev[..rowlen].copy_from_slice(&row[..rowlen]);
                 self.scan_start += rowlen;
 
-                return Ok(Some(InterlacedRow {
-                    data: &self.prev[1..rowlen],
+                return Ok(Some(InterlacedRowBuffer {
+                    data: &mut self.prev[1..rowlen],
                     interlace: passdata,
                 }));
             } else {
-                if self.subframe.consumed_and_flushed {
+                if subframe.consumed_and_flushed {
                     return Err(DecodingError::Format(
                         FormatErrorInner::NoMoreImageData.into(),
                     ));
@@ -788,11 +713,11 @@ impl<R: Read> Reader<R> {
                     self.scan_start = 0;
                 }
 
-                let val = self.decoder.decode_next(&mut self.current)?;
+                let val = decoder.decode_next(&mut self.current)?;
                 match val {
                     Some(Decoded::ImageData) => {}
                     Some(Decoded::ImageDataFlushed) => {
-                        self.subframe.consumed_and_flushed = true;
+                        subframe.consumed_and_flushed = true;
                     }
                     None => {
                         if !self.current.is_empty() {
@@ -810,6 +735,159 @@ impl<R: Read> Reader<R> {
     }
 }
 
+impl Transformer {
+    fn performs(&self, pass: Transformations) -> bool {
+        self.transform.contains(pass)
+    }
+
+    fn output_color_type(&self, info: &SubframeInfo) -> (ColorType, BitDepth) {
+        use ColorType::*;
+
+        if self.transform == Transformations::IDENTITY {
+            return (info.color_type, info.bit_depth);
+        }
+
+        let bits = match info.bit_depth as u8 {
+            16 if self.performs(Transformations::STRIP_16) => 8,
+            n if n < 8 && self.performs(Transformations::EXPAND) => 8,
+            n => n,
+        };
+
+        let color_type = if self.performs(Transformations::EXPAND) {
+            let has_trns = info.transparency;
+            match info.color_type {
+                Grayscale if has_trns => GrayscaleAlpha,
+                Rgb if has_trns => Rgba,
+                Indexed if has_trns => Rgba,
+                Indexed => Rgb,
+                ct => ct,
+            }
+        } else {
+            info.color_type
+        };
+
+        (color_type, BitDepth::from_u8(bits).unwrap())
+    }
+
+    /// Transform one row of the decoded image according to the output transformations.
+    ///
+    /// Return the buffer of transformed data, which may be borrowed from the original buffer if
+    /// transformation could be performed in-place or from the dedicated, allocated output buffer.
+    /// FIXME: Return type should not be Result. Shouldn't we ensure that all errors are handled
+    /// prior? This is currently only due to `expand_paletted` which dynamically check if we have
+    /// a palette set in the `Info`. For example we don't check it for expanding transparency...
+    fn transform<'data>(
+        &'data mut self,
+        info: &Info,
+        subframe_info: &SubframeInfo,
+        row: InterlacedRowBuffer<'data>,
+    ) -> Result<InterlacedRowBuffer<'data>, DecodingError> {
+        use crate::common::ColorType::*;
+        let transform = self.transform;
+
+        if transform == Transformations::IDENTITY {
+            return Ok(row);
+        }
+
+        let (color_type, bit_depth, trns) = {
+            (
+                info.color_type,
+                info.bit_depth as u8,
+                subframe_info.transparency,
+            )
+        };
+
+        // Fallback to buffer large enough for expanding.
+        let _ = self.processed.as_mut_slice().write(row.data);
+
+        // Get the buffer large enough to hold expanded data, if required by transform.
+        let output_buffer = if let InterlaceInfo::Adam7 { width, .. } = row.interlace {
+            let width = self
+                .line_size(subframe_info, width)
+                .expect("Adam7 interlaced rows are shorter than the buffer.");
+            &mut self.processed[..width]
+        } else {
+            &mut self.processed[..]
+        };
+
+        let mut len = output_buffer.len();
+        if transform.contains(Transformations::EXPAND) {
+            match color_type {
+                Indexed => expand_paletted(output_buffer, info)?,
+                Grayscale | GrayscaleAlpha if bit_depth < 8 => expand_gray_u8(output_buffer, info),
+                Grayscale | Rgb if trns => {
+                    let channels = color_type.samples();
+                    let trns = info.trns.as_ref().unwrap();
+                    if bit_depth == 8 {
+                        utils::expand_trns_line(output_buffer, &*trns, channels);
+                    } else {
+                        utils::expand_trns_line16(output_buffer, &*trns, channels);
+                    }
+                }
+                _ => (),
+            }
+        }
+
+        if bit_depth == 16 && transform.intersects(Transformations::STRIP_16) {
+            len /= 2;
+            for i in 0..len {
+                output_buffer[i] = output_buffer[2 * i];
+            }
+        }
+
+        Ok(InterlacedRowBuffer {
+            data: &mut output_buffer[..len],
+            interlace: row.interlace,
+        })
+    }
+
+    /// Returns the number of bytes required to decode a deinterlaced row.
+    fn line_size(&self, info: &SubframeInfo, width: u32) -> Option<usize> {
+        use crate::common::ColorType::*;
+
+        let transform = self.transform;
+        let performs = move |pass| transform.contains(pass);
+
+        let trns = info.transparency;
+
+        let expanded = if info.bit_depth == BitDepth::Sixteen {
+            BitDepth::Sixteen
+        } else {
+            BitDepth::Eight
+        };
+
+        // The color type and depth representing the decoded line
+        // TODO 16 bit
+        let (color, depth) = match info.color_type {
+            Indexed if trns && performs(Transformations::EXPAND) => (Rgba, expanded),
+            Indexed if performs(Transformations::EXPAND) => (Rgb, expanded),
+            Rgb if trns && performs(Transformations::EXPAND) => (Rgba, expanded),
+            Grayscale if trns && performs(Transformations::EXPAND) => (GrayscaleAlpha, expanded),
+            Grayscale if performs(Transformations::EXPAND) => (Grayscale, expanded),
+            GrayscaleAlpha if performs(Transformations::EXPAND) => (GrayscaleAlpha, expanded),
+            other => (other, info.bit_depth),
+        };
+
+        // Without the filter method byte
+        color.checked_raw_row_length(depth, width).map(|n| n - 1)
+    }
+
+    fn allocate_out_buf(
+        &mut self,
+        subframe: &SubframeInfo,
+        limit: usize,
+    ) -> Result<(), DecodingError> {
+        let width = subframe.width;
+        let buflen = match self.line_size(subframe, width) {
+            Some(buflen) if buflen <= limit => buflen,
+            // Should we differentiate between platform limits and others?
+            _ => return Err(DecodingError::LimitsExceeded),
+        };
+        self.processed.resize(buflen, 0u8);
+        Ok(())
+    }
+}
+
 impl SubframeInfo {
     fn not_yet_init() -> Self {
         SubframeInfo {
@@ -818,6 +896,9 @@ impl SubframeInfo {
             rowlen: 0,
             interlace: InterlaceIter::None(0..0),
             consumed_and_flushed: false,
+            color_type: ColorType::Grayscale,
+            bit_depth: BitDepth::Eight,
+            transparency: false,
         }
     }
 
@@ -842,7 +923,15 @@ impl SubframeInfo {
             rowlen: info.raw_row_length_from_width(width),
             interlace,
             consumed_and_flushed: false,
+            color_type: info.color_type,
+            bit_depth: info.bit_depth,
+            transparency: info.trns.is_some(),
         }
+    }
+
+    pub fn raw_row_length_from_width(&self, width: u32) -> usize {
+        self.color_type
+            .raw_row_length_from_width(self.bit_depth, width)
     }
 }
 
