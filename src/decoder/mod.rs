@@ -308,6 +308,8 @@ struct Unfilter {
 struct Transformer {
     /// Output transformations
     transform: Transformations,
+    /// The output transformations relevant for the image color types.
+    effective: Transformations,
     /// Processed line
     processed: Vec<u8>,
 }
@@ -377,6 +379,7 @@ impl<R: Read> Reader<R> {
             },
             transform: Transformer {
                 transform: t,
+                effective: t,
                 processed: Vec::new(),
             },
         }
@@ -433,6 +436,7 @@ impl<R: Read> Reader<R> {
             self.subframe = SubframeInfo::new(info);
         }
 
+        self.transform.set_effective_transform(&self.subframe);
         self.transform
             .allocate_out_buf(&self.subframe, self.limits.bytes)?;
         self.unfilter.prev = vec![0; self.subframe.rowlen];
@@ -769,6 +773,36 @@ impl Transformer {
         (color_type, BitDepth::from_u8(bits).unwrap())
     }
 
+    fn set_effective_transform(&mut self, subframe_info: &SubframeInfo) {
+        use crate::common::ColorType::*;
+        let (color_type, bit_depth, trns) = {
+            (
+                subframe_info.color_type,
+                subframe_info.bit_depth as u8,
+                subframe_info.transparency,
+            )
+        };
+
+        let mut transform = self.transform;
+
+        // Before deciding if there is anything to do, remove trivial transforms. For example,
+        // normalizing transforms that are not required.
+        if transform.intersects(Transformations::EXPAND) {
+            match color_type {
+                Indexed => {}
+                Grayscale | GrayscaleAlpha if bit_depth < 8 => {}
+                Grayscale | Rgb if trns => {}
+                _ => transform.remove(Transformations::EXPAND),
+            }
+        }
+
+        if transform.intersects(Transformations::STRIP_16) && bit_depth < 16 {
+            transform.remove(Transformations::STRIP_16);
+        }
+
+        self.effective = transform;
+    }
+
     /// Transform one row of the decoded image according to the output transformations.
     ///
     /// Return the buffer of transformed data, which may be borrowed from the original buffer if
@@ -783,22 +817,21 @@ impl Transformer {
         row: InterlacedRowBuffer<'data>,
     ) -> Result<InterlacedRowBuffer<'data>, DecodingError> {
         use crate::common::ColorType::*;
-        let transform = self.transform;
-
-        if transform == Transformations::IDENTITY {
-            return Ok(row);
-        }
-
         let (color_type, bit_depth, trns) = {
             (
-                info.color_type,
-                info.bit_depth as u8,
+                subframe_info.color_type,
+                subframe_info.bit_depth as u8,
                 subframe_info.transparency,
             )
         };
 
+        let transform = self.effective;
+        if transform == Transformations::IDENTITY {
+            return Ok(row);
+        }
+
         // Fallback to buffer large enough for expanding.
-        let _ = self.processed.as_mut_slice().write(row.data);
+        self.processed[..row.data.len()].copy_from_slice(row.data);
 
         // Get the buffer large enough to hold expanded data, if required by transform.
         let output_buffer = if let InterlaceInfo::Adam7 { width, .. } = row.interlace {
